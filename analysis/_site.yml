@@ -1,7 +1,7 @@
-name: "lab5"
+name: lab5
 output_dir: ../docs
 navbar:
-  title: "lab5"
+  title: lab5
   left:
   - text: Home
     href: index.html
@@ -9,6 +9,10 @@ navbar:
     href: about.html
   - text: License
     href: license.html
+  right:
+  - icon: fa-github
+    text: Source code
+    href: https://github.com/chris263/lab5
 output:
   workflowr::wflow_html:
     toc: yes
