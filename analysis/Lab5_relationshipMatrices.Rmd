@@ -1,0 +1,229 @@
+---
+title: "Calculating Relationship Matrices"
+author: "Chris Simoes"
+date: "3/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+knitr::opts_chunk$set(message=FALSE)
+knitr::opts_chunk$set(cache=FALSE)
+knitr::opts_chunk$set(tidy=TRUE)
+knitr::opts_chunk$set(results="hold")
+knitr::opts_chunk$set(collapse=TRUE)
+knitr::opts_chunk$set(fig.show="hold")
+knitr::opts_chunk$set(tidy.opts = list(wrap=FALSE))
+```
+
+## Learning Objectives  
+1. Learn how to calculate pedigree and marker-based relationship matrices  
+2. Compare these relationships with the causal relationship matrix, considering the impact of the number of QTL  
+3. See if we can replicate a recent result from Naomi Wray and Peter Visscher`s group on differences in modeling phenotypic correlation for unrelated individuals versus close relatives  
+
+## Reproducibility  
+Here is the [README file](./README.md) for this report  
+
+### Script setup  
+Install packages, start the README.md, set the random seed  
+```{r Script setup, echo=FALSE, include=FALSE}
+ip <- installed.packages()
+packages_used <- c("AlphaSimR", "tidyverse", "workflowr", "here")
+
+ip <- installed.packages()
+for (package in packages_used){
+  if (!(package %in% ip[,"Package"])) install.packages(package)
+}#END packages_used
+
+here::i_am("analysis/Lab5_relationshipMatrices.Rmd")
+
+source(here::here("code/addToREADME.R"))
+addToREADME(paste0("## ", rmarkdown::metadata$title), append=F)
+addToREADME(c(date(), ""))
+
+packages_info <- ip[packages_used, c("Package", "Version", "Built")]
+addToREADME(c("The packages used in this script are:", "Package, Version, Built"))
+apply(packages_info, 1, function(vec) addToREADME(paste(vec, collapse=" ")))
+addToREADME("")
+
+random_seed <- 835241
+set.seed(random_seed)
+addToREADME(paste("The random seed is", random_seed))
+```
+
+
+
+## Create founder haplotypes and set trait  
+
+### Genome / Population parameters  
+The historical effective population size (`historicalNe` here) is the size of the breeding population prior to recorded pedigrees.  
+Test this script with `historicalNe` of either 100 or 1000.  
+```{r Genome parameters}
+historicalNe <- 800
+nFounders <- historicalNe
+nChr <- 7
+segSites <- 2000
+nQTL <- 200
+nSNP <- 1400
+addToREADME(c(
+  paste("Historical effective population size ", historicalNe), 
+  paste("Number of founders ", nFounders), 
+  paste("Number of chromosomes ", nChr), 
+  paste("Number of segregating sites per chromosome", segSites),
+  paste("Number of QTL per chromosome", nQTL),
+  paste("Number of SNPs per chromosome", nSNP))
+)
+```
+
+> Think about the impact of the number of QTL on the QTL relationship matrix and how it compares to the genome-wide relationship matrix  
+
+### Set trait  
+Set the trait type and make founders. `runMacs2` gives more control over the population history of the simulated haplotypes. See documentation.  Here, I want a simple constant effective population size, but not necessarily of 100, the default for runMacs.  
+```{r Set trait}
+founderHaps <- AlphaSimR::runMacs2(nInd=nFounders, nChr=nChr, segSites=segSites, Ne=historicalNe, histNe=NULL, histGen=NULL)
+SP <- AlphaSimR::SimParam$new(founderHaps)
+SP$restrSegSites(minQtlPerChr = nQTL, minSnpPerChr = nSNP, overlap = FALSE) # This prevents SNP from also being QTL
+SP$addTraitA(nQtlPerChr=nQTL)
+SP$addSnpChip(nSnpPerChr=nSNP)
+
+# Create a new population of founders
+founders <- AlphaSimR::newPop(founderHaps, simParam=SP)
+```
+
+### Run generations to create pedigree: setup  
+Specify generation sizes here  
+```{r Run generations setup}
+# Number of selection cycles
+nCyc <- 5
+# Narrow-sense heritability
+h2 <- 0.4
+# Allow for a different number of progeny over cycles
+# Make last gen bigger for sample size
+nProgeny <- rep(500, nCyc); nProgeny[nCyc] <- 1000
+# Whether to randomly mate or to select (that is the question!)
+randomOrSelect <- "random" # Or put "select" if you want...
+# Set the number to select. If nToSelect == nProgeny, it's random mating
+nToSelect <- nProgeny
+if(randomOrSelect == "select") nToSelect <- nToSelect / 10
+
+addToREADME(c("Chunk Run generations setup",
+              paste("Number of cycles", nCyc),
+              paste("Heritability", h2),
+              paste("Random mating or selection", randomOrSelect),
+              paste("Number of progeny", paste(nProgeny, collapse=", ")),
+              paste("Number to select", paste(nToSelect, collapse=", "))
+            )
+          )
+
+# Matrix to save pedigrees
+pedRec <- cbind(id=founders@id, seedPar=founders@mother, pollenPar=founders@father)
+```
+
+
+### Run generations to create pedigree: loop  
+`AlphaSimR` creates the founders with a coalescent and therefore no pedigree. So we can`t look at a pedigree-based relationship matrix on the founders. Here we advance the founders a few generations just to create that pedigree.  
+```{r Loop through cycles}
+selected <- founders
+for (cyc in 1:nCyc){
+  # Create new population by random mating
+  # nCrosses: how many crosses to make
+  # nProgeny: number of progeny per cross
+  progenyPop <- AlphaSimR::randCross(selected, nCrosses=nProgeny[cyc], nProgeny=1)
+  # Get phenotypes
+  progenyPop <- AlphaSimR::setPheno(progenyPop, h2=h2)
+  # Store pedigree in pedRec for analysis
+  pedRec <- rbind(pedRec, cbind(id=progenyPop@id, seedPar=progenyPop@mother, pollenPar=progenyPop@father))
+  # Select
+  # If randomOrSelect == "random", nToSelect will be size of pop: no selection
+  if (cyc < nCyc) selected <- AlphaSimR::selectInd(progenyPop, nToSelect[cyc])
+}
+```
+
+
+### Calculate additive relationship matrices  
+The true or causal relationship matrix is that of QTL. In reality, we don`t have access to that matrix and we approximated it with the pedigree- or SNP-based relationship matrix.  
+The pedigree-based relationship matrix is the expectation of the QTL relationship matrix. The QTL relationship matrix is one realization of that expectation.  
+The SNP relationship matrix is another realization. Assuming SNPs are in LD with the QTL, it should be more strongly correlated to the QTL matrix than the pedigree-based matrix.  
+**NOTE** The code to make these matrices is in "code/calcRelationshipMatrices.R" That`s the meat of this lab, so we will have a look.  
+```{r Make relationship matrices}
+source(here::here("code/calcRelationshipMatrices.R"))
+qtlMat <- AlphaSimR::pullQtlGeno(progenyPop)
+qtlRelMat <- calcGenomicRelationshipMatrix(qtlMat)
+
+snpMat <- AlphaSimR::pullSnpGeno(progenyPop)
+snpRelMat <- calcGenomicRelationshipMatrix(snpMat)
+
+numPedMat <- convertNamesToRows(pedRec) # AlphaSimR uses character names for id
+aMat <- 2 * pedigreeToCCmatrix(numPedMat)
+# Just keep the aMat for the final generation
+totProg <- nrow(numPedMat)
+toKeep <- totProg + (1 - nProgeny[cyc]):0
+aMat <- aMat[toKeep, toKeep]
+```
+
+```{r Side by side}
+# Regress of diagonal elements of one matrix on another
+# Function to return offdiagonal elements of a relationship matrix
+offDiag <- function(relMat){
+  return(c(relMat[upper.tri(relMat)]))
+}
+
+```
+
+ 
+```{r Imitate Visscher}
+# This bit only works if Ne == 100 or Ne == 1000
+# I have set bin sizes so that these work nicely for those two population sizes
+# To try a different population size, figure out how to bin n*(n-1)/2
+if (nProgeny[cyc] == 100) binSizes <- c(75, 200, 200, rep(500, 8), 200, 200, 75) else 
+  binSizes <- c(250, 1000, 1000, 2500, rep(10000, 49), 2500, 1000, 1000, 250)
+
+# Cheating a bit here and using genotypic values rather than phenotypes
+stdPheno <- scale(AlphaSimR::gv(progenyPop), center=T, scale=T)
+
+# Given the number of pairs that you want in each bin, calculate where to place the bin boundaries
+calcBinBoundaries <- function(dataVec, binSizes){
+  csbs <- cumsum(binSizes)
+  binPerc <- csbs/max(csbs)
+  return(quantile(dataVec, probs=binPerc))
+}
+
+# Calculate the mean relatedness and phenotypic correlation within bins 
+calcBinParms <- function(bin, relMat){
+  binBound <- calcBinBoundaries(offDiag(relMat), binSizes)
+  if (bin == 1) pairs <- which(relMat < binBound[bin] & upper.tri(relMat), arr.ind=T) else
+    pairs <- which(relMat >= binBound[bin-1] & relMat < binBound[bin] & upper.tri(relMat), arr.ind=T)
+  pairCor <- stdPheno[pairs[,1]] * stdPheno[pairs[,2]]
+  return(c(mean(relMat[pairs]), mean(pairCor)))
+}
+
+whichMat <- "SNP"
+relMat <- switch(whichMat, 
+                  Pedigree = aMat,
+                  QTL = qtlRelMat,
+                  SNP = snpRelMat,
+                 )
+binParms <- t(sapply(1:length(binSizes), calcBinParms, relMat=relMat))
+xlim <- range(binParms[,1]); ylim <- range(binParms[,2])
+plot(binParms, xlab=paste(whichMat, "relatedness"), ylab="Phenotypic correlation", pch=16)
+lines(range(binParms), range(binParms), col="red")
+
+whichMat <- "QTL"
+relMat <- switch(whichMat, 
+                  Pedigree = aMat,
+                  QTL = qtlRelMat,
+                  SNP = snpRelMat,
+                 )
+binParms <- t(sapply(1:length(binSizes), calcBinParms, relMat=relMat))
+xlim <- range(binParms[,1]); ylim <- range(binParms[,2])
+plot(binParms, xlab=paste(whichMat, "relatedness"), ylab="Phenotypic correlation", pch=16)
+lines(range(binParms), range(binParms), col="red")
+```
+
+> What conditions of QTL number and effective population size lead to a relationship between phenotypic correlation and SNP relatedness similar to that observed in Kemper et al. 2021?  
+
+Note that if you set `historicalNe` much bigger than 1000, it's going to take some time...  
+
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
